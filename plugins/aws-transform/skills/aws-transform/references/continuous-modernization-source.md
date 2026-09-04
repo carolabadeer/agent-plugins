@@ -5,10 +5,6 @@ description: Add/list/remove source connections (GitHub org, GitLab group/user, 
 
 # Source
 
-## Prerequisites
-
-Check if the server is running with `atx ct status --health`. If any command fails with a connection error, use the `server` skill to start the server.
-
 ## Token handling
 
 **Never ask the user to paste or type a token into this chat.** Tokens entered into the chat are visible in the conversation transcript.
@@ -23,6 +19,8 @@ After the user says "done", run `atx ct source list --json` to verify the source
 
 Supported provider types: `github`, `gitlab`, `bitbucket`, `local`
 
+Before adding a source, run `atx ct source list --json` to check whether it already exists. If it does, use `source update` to update the token instead of `source add`.
+
 When adding a source, the agent should inform the customer what PAT scopes are needed and why:
 
 "Your personal access token requires read access to list and scan your repositories for modernization findings, write access to push remediation branches, and pull request (or merge request) creation permissions to deliver the automated fixes for your review."
@@ -36,31 +34,37 @@ Then show the specific scopes for their provider:
 - **Bitbucket:** `read:repository:bitbucket`, `read:account`, `write:repository:bitbucket`, `read:pullrequest:bitbucket`, `write:pullrequest:bitbucket`.
 
 ```bash
-# Add a GitHub org
+# Add a GitHub org (optional: --tags key=value,key2=value2)
 # The GitHub PAT requires the `repo` scope (classic token), or for fine-grained tokens: Read access to metadata (default), Read and Write access to code and pull requests.
-read -s TOKEN && atx ct source add --name <name> --provider github --org <org> --token "$TOKEN"; unset TOKEN
+read -s TOKEN && atx ct source add --name <name> --provider github --org <org> --token "$TOKEN" [--tags key=value,key2=value2]; unset TOKEN
 
 # Add a GitLab group or user (gitlab.com)
 # The GitLab PAT requires the `api` scope.
-read -s TOKEN && atx ct source add --name <name> --provider gitlab --org <group-or-username> --token "$TOKEN"; unset TOKEN
+read -s TOKEN && atx ct source add --name <name> --provider gitlab --org <group-or-username> --token "$TOKEN" [--tags key=value,key2=value2]; unset TOKEN
 
 # Add a GitLab group or user (self-hosted)
 # The GitLab PAT requires the `api` scope.
-read -s TOKEN && atx ct source add --name <name> --provider gitlab --org <group-or-username> --token "$TOKEN" --url https://gitlab.example.com; unset TOKEN
+read -s TOKEN && atx ct source add --name <name> --provider gitlab --org <group-or-username> --token "$TOKEN" --url https://gitlab.example.com [--tags key=value,key2=value2]; unset TOKEN
 
 # Add a Bitbucket workspace (Cloud -- API token with scopes)
 # The Bitbucket PAT requires scopes: read:repository:bitbucket, read:account, write:repository:bitbucket, read:pullrequest:bitbucket, write:pullrequest:bitbucket
-read -s TOKEN && atx ct source add --name <name> --provider bitbucket --org <workspace> --token "$TOKEN" --email <bitbucket-email> --username <bitbucket-username>; unset TOKEN
+read -s TOKEN && atx ct source add --name <name> --provider bitbucket --org <workspace> --token "$TOKEN" --email <bitbucket-email> --username <bitbucket-username> [--tags key=value,key2=value2]; unset TOKEN
 
 # Add a Bitbucket project (Data Center / self-hosted)
 # The Bitbucket PAT requires scopes: read:repository:bitbucket, read:account, write:repository:bitbucket, read:pullrequest:bitbucket, write:pullrequest:bitbucket
-read -s TOKEN && atx ct source add --name <name> --provider bitbucket --org <project-key> --token "$TOKEN" --url https://bitbucket.example.com; unset TOKEN
+read -s TOKEN && atx ct source add --name <name> --provider bitbucket --org <project-key> --token "$TOKEN" --url https://bitbucket.example.com [--tags key=value,key2=value2]; unset TOKEN
 ```
 
 Add a local folder source (no token required):
 
 ```bash
-atx ct source add --name <name> --provider local --path <dir>
+atx ct source add --name <name> --provider local --path <dir> [--tags key=value,key2=value2]
+```
+
+Update token on an existing source (use instead of source add when the source already exists):
+
+```bash
+read -s TOKEN && atx ct source update --name <name> --token "$TOKEN"; unset TOKEN
 ```
 
 ```bash
@@ -111,7 +115,13 @@ atx ct repository update --source <source> --labels "migration:v2"
 atx ct repository delete --repo "<source>::<slug>" --source <source>
 ```
 
+## Pagination (nextToken)
+
+Depending on the CLI version, `atx ct source list` and `atx ct repository list` may return only a bounded page — don't assume a fixed response shape. After each call, if the response carries a non-empty `nextToken`, call the command again with `--next-token <token>` (keeping any `--source`/`--labels` filters) and repeat until no `nextToken` remains. Don't treat the first page as the complete set — otherwise sources or repos silently go missing from listings and downstream scoping.
+
 ## Labels
+
+**Labels ≠ Tags.** Labels are for client-side repo grouping/filtering. Tags (`--tags`) are IAM resource tags for access control (ABAC). When the user says "tag" in the context of access, isolation, teams, or multi-tenancy, use `--tags key=value` on the create command. When they say "label" or want to filter/organize repos for targeted analysis, use labels via `repository update --labels`.
 
 Labels are user-defined identifiers for organizing and filtering groups of repositories.
 
@@ -144,3 +154,37 @@ atx ct repository list --labels "batch:java-upgrade"
 ```
 
 This lets customers organize large orgs into manageable groups (by team, priority, migration wave, etc.) without creating separate sources.
+
+## Tags (resource tagging for access control)
+
+The `--tags` flag attaches IAM resource tags to a source at creation time. Tags enable tag-based access control (ABAC) — scoped IAM policies can restrict which teams see or modify which resources.
+
+```bash
+# Add a source with tags (comma-separated key=value pairs)
+read -s TOKEN && atx ct source add --name <name> --provider github --org <org> --token "$TOKEN" --tags team=alpha,env=prod; unset TOKEN
+```
+
+**Behavior:**
+
+- `--tags key=value,key2=value2` accepts comma-separated pairs in a single flag (e.g. `--tags team=alpha,env=prod`).
+- Tags are optional. If omitted, the source is untagged (visible to all roles, no isolation).
+- Tags are registered with the backend at creation time (tag-on-create). They cannot be modified via `source add` after creation.
+- If `~/.aws/atx/settings.json` defines `applyTags`, those defaults are applied automatically on every create even without explicit `--tags`. An explicit `--tags` override is merged **per key** with the settings defaults: an overridden key takes the `--tags` value, non-overridden default keys are retained, and new keys are added.
+
+**Settings file (`~/.aws/atx/settings.json`):**
+
+```json
+{
+  "applyTags": [
+    { "team": "alpha", "env": "prod" }
+  ]
+}
+```
+
+`applyTags` is an **array of tag maps** (not a single object). Every map in the array is applied on each create operation (`source add`, `analysis run`, `remediation create`) without requiring `--tags` on each command. This keeps tags consistent across the workflow.
+
+- **Multiple maps are legal** and are merged left-to-right into one effective tag set. On a duplicate key across maps, the **last map wins** (it is not an error). For example, `[{ "team": "alpha" }, { "team": "beta", "env": "prod" }]` resolves to `{ "team": "beta", "env": "prod" }`.
+- An empty array (`[]`), a missing `applyTags` key, or a missing file all resolve to no default tags (no error).
+- The merged result must satisfy AWS tag limits (≤ 50 tags; key 1–128 chars; value 0–256 chars), or the CLI aborts with `INVALID_INPUT` (400).
+
+**Malformed settings:** If the file exists but contains invalid JSON, or `applyTags` is structurally invalid (root not a JSON object, `applyTags` not an array, an element that is not an object, or a non-string tag value), the CLI aborts with `SETTINGS_ERROR` (422) identifying the file path and the parse or schema error. If the file is missing, no tags are applied (no error).

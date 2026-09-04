@@ -13,9 +13,9 @@ When the user wants to remediate specific findings, fetch each one with `atx ct 
 
 When using `--transformation-name`, ask the user if they have additional instructions (e.g. a target version or specific guidance) before running. If they do, pass them via `-g "additionalPlanContext=<instructions>"`.
 
-- **`fix` is set** — the finding is auto-remediable via `--ids` alone.
-- **`fix` is null and `recommendation` names a transformation definition** — offer `--ids --transformation-name <name-from-recommendation>`.
-- **`fix` is null and no `recommendation`** — use [Transformation Definition Discovery for Remediation](#transformation-definition-discovery-for-remediation) to find a matching transformation definition.
+- **`fix` is set** — the finding is auto-remediable via `--ids` alone. The server runs the finding's own `fix.transform_name`, which always matches the finding.
+- **`fix` is null and `recommendation` names a transformation definition** — offer `--ids --transformation-name <name-from-recommendation>` ONLY when the finding is exactly the upgrade or migration that transformation definition performs (e.g. a Node.js version finding with a Node.js version-upgrade definition). A `recommendation` can name a transformation definition that does not actually fix the finding — a version-upgrade definition must never be used for ad-hoc work such as deleting files, resolving CDK Nag suppressions, Docker cleanup, or config edits. If the named definition does not directly perform the finding's fix, treat it as if there were no recommendation and use discovery below.
+- **`fix` is null and no `recommendation`** (or a `recommendation` whose named definition does not fit) — use [Transformation Definition Discovery for Remediation](#transformation-definition-discovery-for-remediation) to find a matching transformation definition. If none performs the finding's fix, tell the user it must be fixed manually rather than forcing an unrelated definition.
 
 ## Telemetry
 
@@ -29,8 +29,9 @@ Format: `--telemetry "agent=<agent>,executionMode=<mode>"`
 If the user explicitly asks to disable telemetry, omit `--telemetry` for the rest of the session.
 
 ```bash
-# Create from finding IDs (uses each finding's fix.transform_name)
-atx ct remediation create --ids <id1,id2> --name "Fix name" --telemetry "agent=<AGENT>,executionMode=local"
+# Create from finding IDs (uses each finding's fix.transform_name).
+# Pass --wait so the command blocks until the remediation finishes (version-gated — see "Running long remediations" below).
+atx ct remediation create --ids <id1,id2> --name "Fix name" --wait --telemetry "agent=<AGENT>,executionMode=local"
 
 # Create from finding IDs with a custom TD override (ignores finding's fix field)
 atx ct remediation create --ids <id1,id2> --transformation-name <TD-name> --telemetry "agent=<AGENT>,executionMode=local"
@@ -41,7 +42,7 @@ atx ct remediation create --transformation-name <TD-name> --repo <source>::<slug
 # Create with configuration passed to the TD
 atx ct remediation create --transformation-name <TD-name> --repo <source>::<slug> -g "additionalPlanContext=Upgrade to Node.js 22" --telemetry "agent=<AGENT>,executionMode=local"
 
-# Create with local execution (runs ATX transform on the server instead of GitHub Actions)
+# Create with local execution (runs the ATX transform on the server host instead of on managed remote compute)
 atx ct remediation create --ids <id1,id2> --name "Fix name" --local --telemetry "agent=<AGENT>,executionMode=local"
 
 # List all
@@ -56,6 +57,33 @@ atx ct remediation retry --id <id>
 # Delete
 atx ct remediation delete --id <id>
 ```
+
+## Repository limit per request (max 100)
+
+A single `atx ct remediation create` can be associated with at most **100 repositories**. Before creating a remediation that spans many repos, check how many distinct repositories the target findings cover.
+
+If the remediation would span more than 100 repositories, split it into multiple `remediation create` requests, each covering findings from at most 100 repos, and tell the user you are breaking it up because of the 100-repo-per-request limit. Never create a single remediation associated with more than 100 repositories — it will be rejected. Example: findings across 300 repos → three remediations (100 repos each).
+
+## Running long remediations (--wait, background, logs)
+
+`atx ct remediation create` returns immediately by default with a remediation ID. With `--wait` it blocks until the remediation completes — and applying transforms across repos can take a long time. Prefer `--wait` so you can act on the result in the same step.
+
+**`--wait` is version-gated** — it exists only in newer CLI versions. Confirm support via `atx ct remediation create --help` (or `atx ct --version`) before relying on it; if it isn't listed, run without `--wait` and do not invent the flag. Only re-run without `--wait` if the command fails with an error that explicitly names `--wait` as an unrecognized option AND returned no remediation ID — do not treat auth, `INVALID_INPUT`, or repo-cap failures as a missing-flag error, and never blindly re-run a `create` that may have already submitted.
+
+**Run long jobs in the background and monitor a log.** Start long-running remediations with `&`, redirect output to a log file, and monitor it:
+
+```bash
+atx ct remediation create --ids <id1,id2> --name "Fix name" --wait --telemetry "agent=<AGENT>,executionMode=local" > /tmp/atx-remediation.log 2>&1 &
+tail -f /tmp/atx-remediation.log
+```
+
+The redirect captures the command's diagnostics — the in-process CLI writes logs to STDERR, which `2>&1` folds into the log file. Only warnings and errors are logged by default; when troubleshooting, prefix the command with `ATXCT_LOG_LEVEL=debug` for verbose output.
+
+Tell the user where the log is and how to check progress.
+
+## Listing remediations (pagination)
+
+Depending on the CLI version, `atx ct remediation list` may return only a bounded page — don't assume a fixed response shape. After each call, if the response carries a non-empty `nextToken`, call the command again with `--next-token <token>` and repeat until no `nextToken` remains. Don't treat the first page as complete when a `nextToken` is present.
 
 ## Security Remediation
 
@@ -123,7 +151,7 @@ Only valid with `--transformation-name`.
 
 ## Transformation Definition Discovery for Remediation
 
-When the user asks to remediate with a custom transformation definition, or a finding has no `fix` field and no `recommendation` that mentions a transformation definition, use transformation definition discovery to find the right transformation definition. If a finding already has a `recommendation` naming a transformation definition, skip discovery and use that name directly.
+When the user asks to remediate with a custom transformation definition, or a finding has no `fix` field and no `recommendation` that names a transformation definition which actually performs the finding's fix, use transformation definition discovery to find the right transformation definition. If a finding's `recommendation` names a transformation definition AND that definition is exactly the upgrade/migration that performs the finding's fix, skip discovery and use that name directly; otherwise treat the recommendation as if it were absent and discover.
 
 ### Workflow
 
@@ -137,10 +165,43 @@ When the user asks to remediate with a custom transformation definition, or a fi
 
 ### `--local` flag (remediation create)
 
-When `--local` is passed, the ATX transform runs directly on the server against a cloned copy of the repository instead of dispatching a GitHub Actions workflow. This is useful for:
+When `--local` is passed, the ATX transform runs directly on the server host against a cloned copy of the repository instead of being dispatched to managed remote compute. This is useful for:
 
-- GitHub-sourced repos where you want faster feedback without waiting for CI
-- Environments where GitHub Actions workflows are not configured or available
-- Testing transforms locally before committing to a full workflow run
+- Faster feedback without waiting for a remote job to be scheduled
+- Environments without access to managed remote compute
+- Testing transforms locally before running them on remote compute
 
 The execution mode is persisted on the remediation record (`compute_mode = 'local'`), so subsequent `retry` and `resume` operations automatically honour the original intent without needing to re-specify the flag.
+
+### `--tags` flag (remediation create)
+
+Attaches IAM resource tags to the remediation at creation time.
+
+```bash
+# Create remediation with tags (comma-separated key=value pairs)
+atx ct remediation create --ids <id1,id2> --name "Fix name" --tags team=alpha,env=prod --telemetry "agent=<AGENT>,executionMode=local"
+```
+
+**Behavior:**
+
+- `--tags key=value,key2=value2` accepts comma-separated pairs in a single flag (e.g. `--tags team=alpha,env=prod`).
+- Tags are optional. If omitted, the remediation is untagged.
+- If `~/.aws/atx/settings.json` defines `applyTags` (an array of tag maps), those defaults are applied automatically even without explicit `--tags`. An explicit `--tags` override merges **per key** over the settings defaults.
+
+See the [source](continuous-modernization-source.md) skill's Tags section for the full schema, merge semantics, and error behavior.
+
+## Prerequisites & errors
+
+Remediation shells out to `git`, `atx`, and any provider-specific CLIs, and needs
+valid AWS + provider credentials. See the
+[troubleshooting](continuous-modernization-troubleshooting.md) skill for
+the full actionable-error reference. Common cases:
+
+- **`Required CLI "<tool>" was not found on PATH`** — install the named tool and
+  ensure it's on PATH (the error prints the searched PATH and an install hint).
+- **Connection error** — the CLI can't reach the AWS Transform backend: refresh AWS credentials and confirm `AWS_REGION` is a supported region, then retry.
+- **`AccessDenied` / 403 (AWS)** — refresh AWS credentials, confirm `AWS_REGION`, then retry.
+- **`401` from the provider** — the PAT is invalid/expired; re-add the source with a
+  valid token (`repo` scope; SSO-authorized for the org if required).
+- **A repo shows `blocked` / `failed`** — surface the per-repo error rather than
+  reporting the remediation as done; retry that repo after fixing the cause.
